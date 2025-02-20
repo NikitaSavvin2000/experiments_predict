@@ -1,5 +1,5 @@
 [project]
-name = "inputation_bakcend"
+name = "experiment_predict"
 version = "0.1.0"
 description = ""
 authors = [
@@ -17,6 +17,7 @@ dependencies = [
     "uvicorn>=0.28.0",
     "pandas>=2.2.1",
     "coverage==7.4.4",
+    "requests>=2.32.3",
 ]
 requires-python = ">=3.9"
 readme = "README.md"
