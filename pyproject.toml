@@ -1,0 +1,52 @@
+[project]
+name = "inputation_bakcend"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Nikita Savvin", email = "nikita.vsav@gmail.com"},
+]
+dependencies = [
+    "pytest>=8.1.1",
+    "tox==4.14.2",
+    "pre-commit>=3.6.2",
+    "pytest-cov>=4.1.0",
+    "coverage-badge>=1.1.0",
+    "pdm-bump>=0.7.3",
+    "pydantic>=2.6.3",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+    "pandas>=2.2.1",
+    "coverage==7.4.4",
+]
+requires-python = ">=3.9"
+readme = "README.md"
+license = {text = "MIT"}
+
+[project.optional-dependencies]
+test = [
+    "fastapi-cprofile>=0.0.2",
+]
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+
+[tool.pdm]
+distribution = true
+
+[tool.pytest.ini_options]
+disable_test_id_escaping_and_forfeit_all_rights_to_community_support = true
+addopts = [
+    "--import-mode=importlib",
+]
+testpaths = [
+    "tests",
+]
+timeout = 300
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "unit_transform",
+]
+pythonpath = [
+    "src",
+]
