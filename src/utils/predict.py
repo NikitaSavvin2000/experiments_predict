@@ -87,7 +87,7 @@ class TimeSeriesDataset(Dataset):
         return len(self.data) - self.seq_length
 
     def __getitem__(self, idx):
-        x = self.data[idx:idx + self.seq_length].reshape(self.seq_length, 1)  # Добавляем input_dim=1
+        x = self.data[idx:idx + self.seq_length].reshape(self.seq_length, 1)
         y = self.data[idx + self.seq_length]
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
@@ -120,14 +120,11 @@ class TransformerModel(nn.Module):
         x = self.fc(x[:, -1, :])
         return x
 
-
-
 input_dim = 1
-d_model = 16  # Должно быть кратно nhead
+d_model = 16
 output_dim = 1
-nhead = 4  # nhead должно делиться на d_model
+nhead = 4
 num_layers = 6
-
 
 batch_size = 32
 
@@ -148,7 +145,7 @@ for batch_x, batch_y in train_loader:
 for epoch in range(num_epochs):
     model.train()
     for batch_x, batch_y in train_loader:
-        batch_x = batch_x.squeeze(-1)  # Убираем лишнюю размерность
+        batch_x = batch_x.squeeze(-1)
         optimizer.zero_grad()
         output = model(batch_x)
         loss = criterion(output.squeeze(), batch_y)
