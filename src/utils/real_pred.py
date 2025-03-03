@@ -1,3 +1,10 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import plotly.express as px
+from torch.utils.data import Dataset, DataLoader
+import os
 import os
 import requests
 import pandas as pd
@@ -10,7 +17,6 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 import plotly.express as px
 from config import logger
 
-# Изначальные данные
 df_init = pd.read_csv('src/data/load_consumption_2025.csv')
 # df_init = df_init.iloc[:100000]
 
@@ -22,6 +28,7 @@ print(f'Колонки - {df_init.columns}')
 home_path = os.getcwd()
 
 url_backend = os.getenv("BACKEND_URL", 'http://77.37.136.11:7070')
+
 
 # Метод который из даты делает вектор (Time2Vec)
 def normalization_request(col_time, col_target, json_list_df):
@@ -65,6 +72,7 @@ def reverse_normalization_request(col_time, col_target, json_list_norm_df, min_v
     except Exception as e:
         logger.error(e)
 
+# Перед подачей на эндпоинт нужно все превратить в json
 json_list_general_norm_df = df_init.to_dict(orient='records')
 
 logger.info("Normalizing the data.")
@@ -78,6 +86,7 @@ print(df_general_norm_df.head())
 print(f'Колонки после нормализации - {df_general_norm_df.columns}')
 
 
+# Определение датасета
 class TimeSeriesDataset(Dataset):
     def __init__(self, data, seq_length):
         self.data = data
@@ -87,40 +96,55 @@ class TimeSeriesDataset(Dataset):
         return len(self.data) - self.seq_length
 
     def __getitem__(self, idx):
-        x = self.data[idx:idx + self.seq_length].reshape(self.seq_length, 1)  # Добавляем input_dim=1
-        y = self.data[idx + self.seq_length]
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+        return (
+            torch.tensor(self.data[idx:idx + self.seq_length], dtype=torch.float32),
+            torch.tensor(self.data[idx + self.seq_length], dtype=torch.float32)
+        )
 
-
-data = df_general_norm_df[measurement].values
-
-train_data, test_data = train_test_split(data, test_size=0.2, shuffle=False)
-print(test_data)
-
-seq_length = 24
-train_dataset = TimeSeriesDataset(train_data, seq_length)
-test_dataset = TimeSeriesDataset(test_data, seq_length)
-
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-
-
+# Определение модели
 class TransformerModel(nn.Module):
-    def __init__(self, input_dim, d_model, output_dim, nhead=8, num_layers=6):
+    def __init__(self, input_dim, d_model, output_dim, nhead, num_layers):
         super(TransformerModel, self).__init__()
         self.embedding = nn.Linear(input_dim, d_model)
-        self.encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead), num_layers=num_layers
+        )
         self.fc = nn.Linear(d_model, output_dim)
 
     def forward(self, x):
-        x = x.squeeze(-1)
         x = self.embedding(x.unsqueeze(-1))
-        x = self.transformer_encoder(x)
+        x = self.transformer(x)
         x = self.fc(x[:, -1, :])
         return x
 
+# Функция для пошагового предсказания
+def forecast(model, last_seq, steps=288):
+    model.eval()
+    forecasted = []
+    current_seq = last_seq
 
+    with torch.no_grad():
+        for _ in range(steps):
+            current_seq_tensor = torch.tensor(current_seq, dtype=torch.float32).unsqueeze(0)
+            next_val = model(current_seq_tensor).item()
+            forecasted.append(next_val)
+            current_seq = np.append(current_seq[1:], next_val)
+
+    return np.array(forecasted)
+
+# Подготовка данных
+seq_length = 30
+measurement = "load_consumption"
+full_data = df_general_norm_df[measurement].values
+full_dataset = TimeSeriesDataset(full_data, seq_length)
+full_loader = DataLoader(full_dataset, batch_size=32, shuffle=True)
+
+# Параметры модели
+# input_dim = 1
+# d_model = 64
+# output_dim = 1
+# nhead = 2
+# num_layers = 2
 
 input_dim = 1
 d_model = 16  # Должно быть кратно nhead
@@ -128,27 +152,17 @@ output_dim = 1
 nhead = 4  # nhead должно делиться на d_model
 num_layers = 6
 
-
-batch_size = 32
-
-# model = TransformerModel(input_dim, output_dim, nhead)
+# Создание модели
 model = TransformerModel(input_dim, d_model, output_dim, nhead, num_layers)
-
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-num_epochs = 10
-
-for batch_x, batch_y in train_loader:
-    print("Batch shape before model:", batch_x.shape)
-    output = model(batch_x)
-    print("Output shape:", output.shape)
-    break
-
+# Обучение модели
+num_epochs = 1
 for epoch in range(num_epochs):
     model.train()
-    for batch_x, batch_y in train_loader:
-        batch_x = batch_x.squeeze(-1)  # Убираем лишнюю размерность
+    for batch_x, batch_y in full_loader:
+        batch_x = batch_x.squeeze(-1)
         optimizer.zero_grad()
         output = model(batch_x)
         loss = criterion(output.squeeze(), batch_y)
@@ -156,48 +170,17 @@ for epoch in range(num_epochs):
         optimizer.step()
     print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
 
-model.eval()
+# Получение последней последовательности данных
+last_seq = full_data[-seq_length:]
 
-predictions = []
-with torch.no_grad():
-    for batch_x, _ in test_loader:
-        output = model(batch_x)
-        predictions.append(output.numpy())
+# Прогноз на 288 шагов
+predictions_288 = forecast(model, last_seq, steps=288)
+
+print(f'predictions_288 = {predictions_288}')
 
 
-predictions = np.concatenate(predictions).flatten()
 
-print(f'predictions = {predictions}')
-print()
-
-# Обратная нормализация
-# df_predict_norm = pd.DataFrame({measurement: np.concatenate(predictions)})
-
-# json_list_df_predict_norm = df_general_norm_df.to_dict(orient='records')
-#
-# df_predict = reverse_normalization_request(
-#     col_time='datetime',
-#     col_target=measurement,
-#     json_list_norm_df=json_list_df_predict_norm,
-#     min_val=min_val,
-#     max_val=max_val
-# )
-
-# print(df_predict.head())
-
-# Оценка модели
-y_test = test_data[seq_length:]
-y_pred = predictions
-
-print(predictions)
-
-mape = 100 * mean_absolute_error(y_test, y_pred) / y_test.mean()
-rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-
-print(f'MAPE: {mape:.2f}%')
-print(f'RMSE: {rmse:.2f}')
-
-df = pd.DataFrame({"Index": range(len(predictions)), "Prediction": predictions})
-
-fig = px.line(df, x="Index", y="Prediction", markers=False, title="Predictions Over Time")
+# Визуализация
+fig = px.line(pd.DataFrame({"Index": range(len(predictions_288)), "Prediction": predictions_288}),
+              x="Index", y="Prediction", title="288 Steps Forecast")
 fig.show()
