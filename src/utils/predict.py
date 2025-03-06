@@ -4,11 +4,13 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import numpy as np
+import webbrowser
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import plotly.express as px
 from config import logger
+from pathlib import Path
 
 # Изначальные данные
 df_init = pd.read_csv('src/data/load_consumption_2025.csv')
@@ -95,13 +97,17 @@ class TimeSeriesDataset(Dataset):
 data = df_general_norm_df[measurement].values
 
 train_data, test_data = train_test_split(data, test_size=0.2, shuffle=False)
+train_data, val_data = train_test_split(train_data, test_size=0.2, shuffle=False)
 print(test_data)
+
 
 seq_length = 24
 train_dataset = TimeSeriesDataset(train_data, seq_length)
+val_dataset = TimeSeriesDataset(val_data, seq_length)
 test_dataset = TimeSeriesDataset(test_data, seq_length)
 
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
 
@@ -134,6 +140,11 @@ model = TransformerModel(input_dim, d_model, output_dim, nhead, num_layers)
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
+# Переменные для отслеживания лучшей модели
+best_val_loss = float('inf')
+best_epoch = 0
+model_save_path = 'best_model.pth'
+
 num_epochs = 10
 
 for batch_x, batch_y in train_loader:
@@ -142,18 +153,52 @@ for batch_x, batch_y in train_loader:
     print("Output shape:", output.shape)
     break
 
+patience = 5
+trigger_times = 0
+
 for epoch in range(num_epochs):
+     # Тренировочный этап
     model.train()
+    train_loss = 0
     for batch_x, batch_y in train_loader:
-        batch_x = batch_x.squeeze(-1)
         optimizer.zero_grad()
         output = model(batch_x)
         loss = criterion(output.squeeze(), batch_y)
         loss.backward()
         optimizer.step()
-    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
+        train_loss += loss.item()
+    
+    train_loss /= len(train_loader)
+    
+    # Валидационный этап
+    model.eval()
+    val_loss = 0
+    with torch.no_grad():
+        for batch_x, batch_y in val_loader:
+            output = model(batch_x)
+            loss = criterion(output.squeeze(), batch_y)
+            val_loss += loss.item()
+    
+    val_loss /= len(val_loader)
+    
+    print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+    
+    # Сохранение лучшей модели
+    if val_loss < best_val_loss:
+        trigger_times = 0
+        best_val_loss = val_loss
+        best_epoch = epoch + 1
+        torch.save(model.state_dict(), model_save_path)
+        print(f"Лучшая модель сохранена (Эпоха {best_epoch}, Val Loss: {best_val_loss:.4f})")
+    else:
+        trigger_times += 1
+        if trigger_times >= patience:
+            print(f"Ранняя остановка на эпохе {epoch+1}")
+            break
 
+model.load_state_dict(torch.load(model_save_path))
 model.eval()
+
 
 predictions = []
 with torch.no_grad():
@@ -168,19 +213,22 @@ print(f'predictions = {predictions}')
 print()
 
 # Обратная нормализация
-# df_predict_norm = pd.DataFrame({measurement: np.concatenate(predictions)})
+df_predict_norm = pd.DataFrame({
+    measurement: predictions.flatten(), 
+    'datetime': df_general_norm_df['datetime'].values[-len(predictions):] 
+})
 
-# json_list_df_predict_norm = df_general_norm_df.to_dict(orient='records')
-#
-# df_predict = reverse_normalization_request(
-#     col_time='datetime',
-#     col_target=measurement,
-#     json_list_norm_df=json_list_df_predict_norm,
-#     min_val=min_val,
-#     max_val=max_val
-# )
+json_list_df_predict_norm = df_general_norm_df.to_dict(orient='records')
 
-# print(df_predict.head())
+df_predict_denorm = reverse_normalization_request(
+    col_time='datetime',
+    col_target=measurement,
+    json_list_norm_df=json_list_df_predict_norm,
+    min_val=min_val,
+    max_val=max_val
+)
+
+print(df_predict_denorm.head())
 
 # Оценка модели
 y_test = test_data[seq_length:]
@@ -198,3 +246,91 @@ df = pd.DataFrame({"Index": range(len(predictions)), "Prediction": predictions})
 
 fig = px.line(df, x="Index", y="Prediction", markers=False, title="Predictions Over Time")
 fig.show()
+
+if df_predict_denorm is not None and not df_predict_denorm.empty:
+    # Получаем реальные тестовые данные в исходном масштабе
+    y_test_denorm = test_data[seq_length:] * (max_val - min_val) + min_val
+
+    # Формируем временные метки
+    datetime_values = df_general_norm_df['datetime'].values[-len(y_test_denorm):]
+
+    test_start_idx = len(train_data)
+    test_end_idx = test_start_idx + len(test_data)
+    test_datetime = df_general_norm_df['datetime'].values[test_start_idx:test_end_idx]
+    datetime_values = test_datetime[seq_length:]
+
+    # Создаем DataFrame для визуализации
+    df_plot = pd.DataFrame({
+        'Время': datetime_values,
+        'Реальные значения': y_test_denorm,
+        'Предсказания модели': df_predict_denorm[measurement].values[:len(datetime_values)]
+    }).dropna()
+
+    # Проверка совпадения длин массивов
+    assert len(df_plot['Время']) == len(df_plot['Реальные значения']) == len(df_plot['Предсказания модели']), \
+        f"Несовпадение длин: Время {len(datetime_values)}, Реальные {len(y_test_denorm)}, Предсказания {len(df_predict_denorm)}"
+
+    # Диагностический вывод
+    print("Данные для визуализации:")
+    print(df_plot.head())
+    print(f"Длина временных меток: {len(datetime_values)}")
+    print(f"Реальные значения: {len(y_test_denorm)}")
+    print(f"Предсказания: {len(df_predict_denorm)}")
+
+    # Упрощенная визуализация
+    fig = px.line(df_plot, 
+                  x='Время', 
+                  y=['Реальные значения', 'Предсказания модели'],
+                  title='Сравнение реальных данных и предсказаний модели')
+    
+    # Визуализация
+    fig = px.line(df_plot, 
+                  x='Время', 
+                  y=['Реальные значения', 'Предсказания модели'],
+                  title='Сравнение реальных данных и предсказаний модели',
+                  labels={'value': 'Потребление', 'variable': 'Тип данных'},
+                  color_discrete_map={'Реальные значения': '#2E86C1', 'Предсказания модели': '#E74C3C'})
+
+    fig.update_layout(
+        xaxis_title='Дата и время',
+        yaxis_title='Потребление',
+        legend_title='Легенда',
+        hovermode='x unified',
+        template='plotly_white',
+        xaxis=dict(
+            rangeselector=dict(
+                buttons=list([
+                    dict(count=1, label="1 час", step="hour", stepmode="backward"),
+                    dict(count=6, label="6 часов", step="hour", stepmode="backward"),
+                    dict(step="all")
+                ])
+            ),
+            rangeslider=dict(visible=True),
+            type="date"
+        )
+    )
+
+    # Добавляем вертикальную линию раздела
+    train_end_idx = len(train_data) + seq_length
+    if train_end_idx < len(df_general_norm_df):
+        # Получаем временную метку
+        vertical_line_date = pd.to_datetime(
+            df_general_norm_df['datetime'].values[train_end_idx]
+        )
+        
+        # Добавляем линию с преобразованием в timestamp
+        fig.add_vline(
+            x=vertical_line_date.timestamp(),
+            line_dash="dot", 
+            line_color="gray",
+            annotation_text="Начало предсказаний",
+            annotation_position="top right"
+        )
+
+    fig.show()
+    html_file = "prediction_comparison.html"
+    fig.write_html(html_file)
+    print("График сохранен в prediction_comparison.html")
+    webbrowser.open(f"file://{Path(html_file).absolute()}")
+else:
+    logger.error("Ошибка: Не удалось получить денормализованные предсказания")
