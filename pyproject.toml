@@ -15,9 +15,11 @@ dependencies = [
     "pydantic>=2.6.3",
     "fastapi>=0.110.0",
     "uvicorn>=0.28.0",
-    "pandas>=2.2.1",
+    "pandas>=2.2.3",
     "coverage==7.4.4",
     "requests>=2.32.3",
+    "torch>=2.6.0",
+    "scikit-learn>=1.6.1",
 ]
 requires-python = ">=3.9"
 readme = "README.md"
