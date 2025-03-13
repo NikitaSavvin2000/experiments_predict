@@ -220,9 +220,6 @@ torch.save(model, f"{path_to_save}/model_full.pth")
 
 with torch.no_grad():
     for _ in range(HORIZON):
-        print('='*150)
-        print(input_seq)
-        break
         pred = model(input_seq).cpu().item()
         future_predictions.append(pred)
         next_input = np.roll(input_seq.cpu().numpy(), -1, axis=1)
