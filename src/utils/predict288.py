@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 import plotly.express as px
+import webbrowser
+from pathlib import Path
 
 # Параметры
 seq_length = 24
@@ -63,3 +65,8 @@ print("Предсказание завершено.")
 fig = px.line(pd.DataFrame({"Index": range(len(predictions_288)), "Prediction": predictions_288}),
               x="Index", y="Prediction", title="288 Steps Forecast")
 fig.show()
+
+html_file = "prediction288_comparison.html"
+fig.write_html(html_file)
+print("График сохранен в prediction288_comparison.html")
+webbrowser.open(f"file://{Path(html_file).absolute()}")
