@@ -17,8 +17,38 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 import plotly.express as px
 from config import logger
 
-df_init = pd.read_csv('src/data/load_consumption_2025.csv')
-# df_init = df_init.iloc[:100000]
+
+def fetch_data_from_db():
+    table_name = 'load_consumption'
+    measurement = 'load_consumption'
+
+    DB_PARAMS = {
+        "dbname": "mydb",
+        "user": "myuser",
+        "password": "mypassword",
+        "host": "77.37.136.11",
+        "port": 8083
+    }
+
+
+    conn = psycopg2.connect(**DB_PARAMS)
+    cur = conn.cursor()
+
+    select_query = f"""
+    SELECT * FROM {table_name} ORDER BY datetime;
+    """
+
+    cur.execute(select_query)
+    rows = cur.fetchall()
+
+    df_result = pd.DataFrame(rows, columns=["datetime", measurement])
+    df_result["datetime"] = df_result["datetime"].dt.tz_localize(None)
+
+    cur.close()
+    conn.close()
+    return df_result
+
+df_init = fetch_data_from_db()
 
 measurement = 'load_consumption'
 

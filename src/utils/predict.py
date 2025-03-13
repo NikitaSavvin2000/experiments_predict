@@ -10,6 +10,24 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 import plotly.express as px
 from config import logger
 
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler
+
+
 # Изначальные данные
 df_init = pd.read_csv('src/data/load_consumption_2025.csv')
 # df_init = df_init.iloc[:100000]
@@ -42,8 +60,6 @@ def normalization_request(col_time, col_target, json_list_df):
         logger.error(e)
         return None, None, None
 
-
-# Метод который восстанавливает данные из вектора
 def reverse_normalization_request(col_time, col_target, json_list_norm_df, min_val, max_val):
     url = f'{url_backend}/backend/v1/reverse_normalization'
     json = {
@@ -65,6 +81,9 @@ def reverse_normalization_request(col_time, col_target, json_list_norm_df, min_v
     except Exception as e:
         logger.error(e)
 
+
+
+
 json_list_general_norm_df = df_init.to_dict(orient='records')
 
 logger.info("Normalizing the data.")
@@ -78,28 +97,51 @@ print(df_general_norm_df.head())
 print(f'Колонки после нормализации - {df_general_norm_df.columns}')
 
 
+features = len(df_general_norm_df.columns)
+
+for col in df_general_norm_df.columns:
+    try:
+        df_general_norm_df[col] = pd.to_numeric(df_general_norm_df[col], errors='coerce')
+    except:
+        print(f"Ошибка преобразования столбца {col}. Проверьте данные на наличие нечисловых значений.")
+        # Здесь можно добавить более сложную обработку ошибок (например, удаление столбца, если он содержит много нечисловых данных)
+
+
+
+# Масштабирование данных (очень важно для нейронных сетей)
+# scaler = StandardScaler()
+# numerical_cols = df_general_norm_df.select_dtypes(include=np.number).columns
+# df_general_norm_df[numerical_cols] = scaler.fit_transform(df_general_norm_df[numerical_cols])
+
+# Разделяем на признаки (X) и целевую переменную (y)
+X = df_general_norm_df.drop('load_consumption', axis=1).values
+y = df_general_norm_df['load_consumption'].values
+
+# Разделяем данные на тренировочный и тестовый наборы
+train_X, test_X, train_y, test_y = train_test_split(X, y, test_size=0.01, shuffle=False)
+
+
+seq_length = 24
+
+
 class TimeSeriesDataset(Dataset):
-    def __init__(self, data, seq_length):
-        self.data = data
+    def __init__(self, X, y, seq_length):
+        self.X = X
+        self.y = y
         self.seq_length = seq_length
+        self.num_features = X.shape[1]
 
     def __len__(self):
-        return len(self.data) - self.seq_length
+        return len(self.X) - self.seq_length
 
     def __getitem__(self, idx):
-        x = self.data[idx:idx + self.seq_length].reshape(self.seq_length, 1)
-        y = self.data[idx + self.seq_length]
+        x = self.X[idx:idx + self.seq_length]
+        y = self.y[idx + self.seq_length]
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
 
-data = df_general_norm_df[measurement].values
-
-train_data, test_data = train_test_split(data, test_size=0.2, shuffle=False)
-print(test_data)
-
-seq_length = 24
-train_dataset = TimeSeriesDataset(train_data, seq_length)
-test_dataset = TimeSeriesDataset(test_data, seq_length)
+train_dataset = TimeSeriesDataset(train_X, train_y, seq_length)
+test_dataset = TimeSeriesDataset(test_X, test_y, seq_length)
 
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
@@ -114,38 +156,30 @@ class TransformerModel(nn.Module):
         self.fc = nn.Linear(d_model, output_dim)
 
     def forward(self, x):
-        x = x.squeeze(-1)
-        x = self.embedding(x.unsqueeze(-1))
+        x = self.embedding(x)
         x = self.transformer_encoder(x)
         x = self.fc(x[:, -1, :])
         return x
 
-input_dim = 1
+
+input_dim = len(df_general_norm_df.columns) - 1 # Количество признаков (без целевой переменной)
 d_model = 16
 output_dim = 1
 nhead = 4
 num_layers = 6
-
 batch_size = 32
 
-# model = TransformerModel(input_dim, output_dim, nhead)
 model = TransformerModel(input_dim, d_model, output_dim, nhead, num_layers)
 
 criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-num_epochs = 10
+num_epochs = 1
 
-for batch_x, batch_y in train_loader:
-    print("Batch shape before model:", batch_x.shape)
-    output = model(batch_x)
-    print("Output shape:", output.shape)
-    break
 
 for epoch in range(num_epochs):
     model.train()
     for batch_x, batch_y in train_loader:
-        batch_x = batch_x.squeeze(-1)
         optimizer.zero_grad()
         output = model(batch_x)
         loss = criterion(output.squeeze(), batch_y)
@@ -154,15 +188,19 @@ for epoch in range(num_epochs):
     print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
 
 model.eval()
-
 predictions = []
 with torch.no_grad():
     for batch_x, _ in test_loader:
         output = model(batch_x)
         predictions.append(output.numpy())
 
-
 predictions = np.concatenate(predictions).flatten()
+
+
+
+
+
+
 
 print(f'predictions = {predictions}')
 print()

@@ -21,6 +21,8 @@ dependencies = [
     "torch>=2.6.0",
     "scikit-learn>=1.6.1",
     "plotly>=6.0.0",
+    "matplotlib>=3.9.4",
+    "psycopg2-binary>=2.9.10",
 ]
 requires-python = ">=3.9"
 readme = "README.md"
