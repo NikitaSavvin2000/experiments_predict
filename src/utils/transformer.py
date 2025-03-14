@@ -16,25 +16,16 @@ from torch.utils.data import TensorDataset, DataLoader, Dataset
 home_path = os.getcwd()
 path_to_save = f'{home_path}/src/models_res'
 
-# LAG = 5
-# HORIZON = 288
-# BATCH_SIZE = 2
-# EPOCHS = 1
-# LR = 0.00001
-# D_MODEL = 4
-# NHEAD = 4
-# NUM_LAYERS = 2
-# DROPOUT = 0.2
-
-LAG = 2
+LAG = 5
 HORIZON = 288
 BATCH_SIZE = 1
 EPOCHS = 1
 LR = 0.00001
-D_MODEL = 4
-NHEAD = 4
-NUM_LAYERS = 1
+D_MODEL = 2
+NHEAD = 2
+NUM_LAYERS = 2
 DROPOUT = 0.2
+points_per_call = LAG*4
 
 measurement = 'load_consumption'
 
@@ -42,9 +33,13 @@ home_path = os.getcwd()
 
 url_backend = os.getenv("BACKEND_URL", 'http://77.37.136.11:7070')
 
-col_for_train = [measurement, 'month', 'day', 'week', 'day_of_week',
-                 'hour', 'minute', 'hour_cos', 'day_of_week_cos', 'week_cos', 'month_cos',
-                 'part_of_day', 'is_night', 'is_weekend', 'day_of_year']
+# col_for_train = [measurement, 'month', 'day', 'week', 'day_of_week',
+#                  'hour', 'minute', 'hour_cos', 'day_of_week_cos', 'week_cos', 'month_cos',
+#                  'part_of_day', 'is_night', 'is_weekend', 'day_of_year']
+
+col_for_train = [measurement, "year", "month", "day", "week", "day_of_week", "hour", "minute", "hour_sin", "hour_cos",
+                 "day_of_week_sin", "day_of_week_cos", "week_sin", "week_cos", "month_sin", "month_cos", "part_of_day",
+                 "is_night", "is_weekend", "day_of_year"]
 
 """ Possible columns for train
 
@@ -205,21 +200,42 @@ class TimeSeriesDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-class TimeSeriesTransformer(nn.Module):
-
-    def __init__(self, input_dim, d_model=D_MODEL, nhead=NHEAD, num_layers=NUM_LAYERS, dropout=DROPOUT):
-        super(TimeSeriesTransformer, self).__init__()
-        self.embedding = nn.Linear(input_dim, d_model)
-        self.positional_encoding = nn.Parameter(torch.randn(1, LAG, d_model))
-        self.encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
-        self.fc = nn.Linear(d_model, 1)
+class AttentionPooling(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.attn = nn.Linear(d_model, 1)
 
     def forward(self, x):
-        x = self.embedding(x) + self.positional_encoding
+        attn_weights = torch.softmax(self.attn(x), dim=1)  # Вычисляем веса
+        return (x * attn_weights).sum(dim=1)
+
+
+class TimeSeriesTransformer(nn.Module):
+
+    def __init__(self, input_dim, d_model=D_MODEL, nhead=NHEAD, num_layers=NUM_LAYERS, dropout=DROPOUT, output_seq_len=points_per_call):
+        super(TimeSeriesTransformer, self).__init__()
+        self.embedding = nn.Linear(input_dim, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(d_model)
+
+        encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True, norm_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+
+        self.attn_pool = AttentionPooling(d_model)
+        self.fc = nn.Linear(d_model, output_seq_len)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        x = self.dropout(x)
+        x_residual = x
+
+        x = self.layer_norm(x)
         x = self.transformer_encoder(x)
-        x = x[:, -1, :]
-        return self.fc(x).squeeze(-1)
+
+        x = x + x_residual
+        x = self.attn_pool(x)
+        return self.fc(x)
+
 
 
 df_init = fetch_data_from_db()
@@ -290,7 +306,7 @@ progress_bar_epochs = tqdm(range(EPOCHS), desc=f"Epoch")
 for epoch in progress_bar_epochs:
     model.train()
     train_loss = 0.0
-    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")  # Прогресс-бар
+    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
     for X_batch, y_batch in progress_bar:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
@@ -301,7 +317,7 @@ for epoch in progress_bar_epochs:
         optimizer.step()
         train_loss += loss.item()
 
-        progress_bar.set_postfix(loss=train_loss / len(train_loader))  # Обновление инфо
+        progress_bar.set_postfix(loss=train_loss / len(train_loader))
 
     print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {train_loss/len(train_loader):.4f}")
 
@@ -312,7 +328,7 @@ save_path = f"{path_to_save}/model_weights.pth"
 torch.save(model.state_dict(), save_path)
 torch.save(model, f"{path_to_save}/model_full.pth")
 
-future_predictions = make_predictions(x_input=x_input, x_future=x_future, points_per_call=1, model=model)
+future_predictions = make_predictions(x_input=x_input, x_future=x_future, points_per_call=points_per_call, model=model)
 
 df_forecast[diff_cols] = df_true_all_col[diff_cols]
 
