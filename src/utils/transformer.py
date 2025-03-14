@@ -8,64 +8,50 @@ import torch.nn as nn
 import torch.optim as optim
 import plotly.graph_objects as go
 
+from tqdm import tqdm
 from config import logger
-from torch.utils.data import Dataset, DataLoader
+from plotly.subplots import make_subplots
+from torch.utils.data import TensorDataset, DataLoader, Dataset
 
 home_path = os.getcwd()
 path_to_save = f'{home_path}/src/models_res'
 
-LAG = 5
+# LAG = 5
+# HORIZON = 288
+# BATCH_SIZE = 2
+# EPOCHS = 1
+# LR = 0.00001
+# D_MODEL = 4
+# NHEAD = 4
+# NUM_LAYERS = 2
+# DROPOUT = 0.2
+
+LAG = 2
 HORIZON = 288
-BATCH_SIZE = 64
-EPOCHS = 3
-LR = 0.0005
-D_MODEL = 64
-NHEAD = 2
-NUM_LAYERS = 2
-DROPOUT = 0.1
-
-
-def fetch_data_from_db():
-    table_name = 'load_consumption'
-    measurement = 'load_consumption'
-
-    DB_PARAMS = {
-        "dbname": "mydb",
-        "user": "myuser",
-        "password": "mypassword",
-        "host": "77.37.136.11",
-        "port": 8083
-    }
-
-    conn = psycopg2.connect(**DB_PARAMS)
-    cur = conn.cursor()
-
-    select_query = f"""
-    SELECT * FROM {table_name} ORDER BY datetime;
-    """
-
-    cur.execute(select_query)
-    rows = cur.fetchall()
-
-    df_result = pd.DataFrame(rows, columns=["datetime", measurement])
-    df_result["datetime"] = df_result["datetime"].dt.tz_localize(None)
-
-    cur.close()
-    conn.close()
-    return df_result
-
-
-df = fetch_data_from_db()
-df_init = df[:-288]
-df_test = df[-288:]
-print(df_init)
-print(df_test)
+BATCH_SIZE = 1
+EPOCHS = 1
+LR = 0.00001
+D_MODEL = 4
+NHEAD = 4
+NUM_LAYERS = 1
+DROPOUT = 0.2
 
 measurement = 'load_consumption'
 
 home_path = os.getcwd()
 
 url_backend = os.getenv("BACKEND_URL", 'http://77.37.136.11:7070')
+
+col_for_train = [measurement, 'month', 'day', 'week', 'day_of_week',
+                 'hour', 'minute', 'hour_cos', 'day_of_week_cos', 'week_cos', 'month_cos',
+                 'part_of_day', 'is_night', 'is_weekend', 'day_of_year']
+
+""" Possible columns for train
+
+["year", "month", "day", "week", "day_of_week", "hour", "minute", "second", "hour_sin", "hour_cos",
+ "day_of_week_sin", "day_of_week_cos", "week_sin", "week_cos", "month_sin", "month_cos", "part_of_day",
+  "is_night", "is_weekend", "day_of_year"]
+"""
 
 
 # Метод который из даты делает вектор (Time2Vec)
@@ -110,50 +96,100 @@ def reverse_normalization_request(col_time, col_target, json_list_norm_df, min_v
         logger.error(e)
 
 
-df_init['datetime'] = df_init['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
-
-json_list_general_norm_df = df_init.to_dict(orient='records')
-logger.info("Normalizing the data.")
-
-df_general_norm_df, min_val, max_val = normalization_request(
-    col_time='datetime',
-    col_target=measurement,
-    json_list_df=json_list_general_norm_df
-)
-print(df_general_norm_df)
-
-df_test['datetime'] = df_test['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
-
-json_list_test_norm_df = df_test.to_dict(orient='records')
-
-logger.info("Normalizing the data.")
-df_test_norm, min_val_test, max_val_testv = normalization_request(
-    col_time='datetime',
-    col_target=measurement,
-    json_list_df=json_list_test_norm_df
-)
+def cast_logger(message):
+    count = len(message) + 4
+    if count > 150:
+        count = 150
+    print('='*count)
+    print(f'>>> {message}')
+    print('='*count)
 
 
-def create_sequences(df, target_col, seq_length):
-    features = df.drop(columns=[target_col]).values
-    target = df[target_col].values
+def make_predictions(x_input, x_future, points_per_call, model, device="cpu"):
+    model.eval()
+    predict_values = []
+    x_future_len = len(x_future)
+    remaining_horizon = x_future_len
+
+    while remaining_horizon > 0:
+        current_points_to_predict = min(remaining_horizon, points_per_call)
+
+        x_input_tensor = torch.tensor(x_input, dtype=torch.float32).to(device)
+        x_input_tensor = x_input_tensor.unsqueeze(0)
+
+        with torch.no_grad():
+            y_predict = model(x_input_tensor)
+
+        y_predict = y_predict.cpu().numpy().flatten()
+
+        y_predict = y_predict[:current_points_to_predict]
+        predict_values.extend(y_predict)
+
+        for i in range(current_points_to_predict):
+            cur_val = y_predict[i]
+            x_input = np.delete(x_input, 0, axis=0)
+            future_lag = x_future[0]
+            x_future = np.delete(x_future, 0, axis=0)
+            future_lag[0] = cur_val
+            x_input = np.append(x_input, future_lag.reshape(1, -1), axis=0)
+
+        remaining_horizon -= current_points_to_predict
+
+    return predict_values
+
+
+def create_x_input(df_train, n_steps):
+    df_input = df_train.iloc[len(df_train) - n_steps:]
+    x_input = df_input.values
+    return x_input
+
+
+def fetch_data_from_db():
+    table_name = 'load_consumption'
+    measurement = 'load_consumption'
+
+    DB_PARAMS = {
+        "dbname": "mydb",
+        "user": "myuser",
+        "password": "mypassword",
+        "host": "77.37.136.11",
+        "port": 8083
+    }
+
+    conn = psycopg2.connect(**DB_PARAMS)
+    cur = conn.cursor()
+
+    select_query = f"""
+    SELECT * FROM {table_name} ORDER BY datetime;
+    """
+
+    cur.execute(select_query)
+    rows = cur.fetchall()
+
+    df_result = pd.DataFrame(rows, columns=["datetime", measurement])
+    df_result["datetime"] = df_result["datetime"].dt.tz_localize(None)
+
+    cur.close()
+    conn.close()
+    return df_result
+
+
+def mean_absolute_percentage_error(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+
+def split_sequence(sequence, n_steps, points_per_call):
     X, y = [], []
-    for i in range(len(df) - seq_length):
-        X.append(features[i : i + seq_length])
-        y.append(target[i + seq_length])
+    for i in range(len(sequence)):
+        end_ix = i + n_steps
+        out_end_ix = end_ix + points_per_call
+        if out_end_ix > len(sequence):
+            break
+        seq_x, seq_y = sequence[i:end_ix, :], sequence[end_ix:out_end_ix, 0]
+        X.append(seq_x)
+        y.append(seq_y)
     return np.array(X), np.array(y)
-
-
-df = df_general_norm_df
-
-df = df.drop(columns=["datetime"])
-
-X, y = create_sequences(df, "load_consumption", LAG)
-X = X.astype(np.float32)
-y = y.astype(np.float32)
-
-X_tensor = torch.tensor(X, dtype=torch.float32)
-y_tensor = torch.tensor(y, dtype=torch.float32)
 
 
 class TimeSeriesDataset(Dataset):
@@ -167,10 +203,6 @@ class TimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
-
-
-train_dataset = TimeSeriesDataset(X_tensor, y_tensor)
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 
 class TimeSeriesTransformer(nn.Module):
@@ -190,15 +222,77 @@ class TimeSeriesTransformer(nn.Module):
         return self.fc(x).squeeze(-1)
 
 
+df_init = fetch_data_from_db()
+
+df_init['datetime'] = df_init['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+json_list_general_norm_df = df_init.to_dict(orient='records')
+logger.info("Normalizing the data.")
+
+message = 'Vectorizing the data'
+cast_logger(message=message)
+
+df_general_norm_df, min_val, max_val = normalization_request(
+    col_time='datetime',
+    col_target=measurement,
+    json_list_df=json_list_general_norm_df
+)
+
+df_general_norm_df = df_general_norm_df.drop(columns=['datetime'])
+all_col = df_general_norm_df.columns
+
+# =============== Preparing data for training ================
+
+df = df_general_norm_df
+
+diff_cols = all_col.difference(col_for_train)
+
+train_index = int(len(df) - HORIZON)
+df_train_all_col = df.iloc[:train_index]
+df_test_all_col = df.iloc[train_index:]
+
+df_true_all_col = df_test_all_col.copy()
+df = df_general_norm_df[col_for_train]
+df_train = df.iloc[:train_index]
+values = df_train[col_for_train].values
+
+X, y = split_sequence(values, LAG, 1)
+
+df_test = df.iloc[train_index:]
+
+df_for_comparison = df_init.iloc[train_index:]
+
+df_true = df_test.copy()
+df_forecast = df_test.copy()
+x_input = create_x_input(df_train, LAG)
+df_test = df_test.copy()
+x_future = df_test.values
+n_features = values.shape[1]
+
+X_tensor = torch.tensor(X, dtype=torch.float32)
+y_tensor = torch.tensor(y, dtype=torch.float32)
+
+dataset = TensorDataset(X_tensor, y_tensor)
+train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+# ===========================================================
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = TimeSeriesTransformer(input_dim=X.shape[2]).to(device)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=LR)
 
-for epoch in range(EPOCHS):
+message = 'Started training'
+cast_logger(message=message)
+
+progress_bar_epochs = tqdm(range(EPOCHS), desc=f"Epoch")
+
+for epoch in progress_bar_epochs:
     model.train()
     train_loss = 0.0
-    for X_batch, y_batch in train_loader:
+    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")  # Прогресс-бар
+
+    for X_batch, y_batch in progress_bar:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
         optimizer.zero_grad()
         outputs = model(X_batch)
@@ -206,48 +300,62 @@ for epoch in range(EPOCHS):
         loss.backward()
         optimizer.step()
         train_loss += loss.item()
+
+        progress_bar.set_postfix(loss=train_loss / len(train_loader))  # Обновление инфо
+
     print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {train_loss/len(train_loader):.4f}")
 
 
 model.eval()
-future_predictions = []
-input_seq = torch.tensor(X[-1], dtype=torch.float32).unsqueeze(0).to(device)
-print(f'input_seq = {input_seq}')
 
 save_path = f"{path_to_save}/model_weights.pth"
 torch.save(model.state_dict(), save_path)
 torch.save(model, f"{path_to_save}/model_full.pth")
 
-with torch.no_grad():
-    for _ in range(HORIZON):
-        pred = model(input_seq).cpu().item()
-        future_predictions.append(pred)
-        next_input = np.roll(input_seq.cpu().numpy(), -1, axis=1)
-        next_input[0, -1, :-1] = next_input[0, -2, :-1]
-        next_input[0, -1, -1] = pred
-        input_seq = torch.tensor(next_input, dtype=torch.float32).to(device)
+future_predictions = make_predictions(x_input=x_input, x_future=x_future, points_per_call=1, model=model)
 
-# print(f'future_predictions = {future_predictions}')
+df_forecast[diff_cols] = df_true_all_col[diff_cols]
 
-real_values = df_test_norm[measurement]
+df_forecast[measurement] = future_predictions
 
-def mean_absolute_percentage_error(y_true, y_pred):
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+json_list_df_forecast = df_forecast.to_dict(orient='records')
+logger.info("Normalizing the data.")
+
+message = 'Vector decoding'
+cast_logger(message=message)
+
+df_predict = reverse_normalization_request(
+    col_time='datetime',
+    col_target=measurement,
+    json_list_norm_df=json_list_df_forecast,
+    min_val=min_val,
+    max_val=max_val
+)
+
+future_predictions = df_predict[measurement]
+real_values = df_for_comparison[measurement]
 
 mape_value = mean_absolute_percentage_error(real_values, future_predictions)
 
-fig = go.Figure()
-fig.add_trace(go.Scatter(y=real_values, mode='lines', name='Real Values', line=dict(color='blue')))
-fig.add_trace(go.Scatter(y=future_predictions, mode='lines', name='Predicted Future', line=dict(color='orange')))
-fig.update_layout(
-    title=f'Actual vs Predicted (MAPE: {mape_value:.2f}%)',
-    xaxis_title='Time',
-    yaxis_title='Value',
-    template='plotly_white'
+fig_consumption = make_subplots(rows=1, cols=1, subplot_titles=['consumption_real vs consumption_predict'])
+
+fig_consumption.add_trace(
+    go.Scatter(x=df_for_comparison['datetime'], y=df_for_comparison[measurement], mode='lines', name='consumption_real', line=dict(color='blue')), row=1,
+    col=1)
+fig_consumption.add_trace(go.Scatter(x=df_predict['datetime'], y=df_predict[measurement], mode='lines', name='consumption_predict',
+                                     line=dict(color='orange')), row=1, col=1)
+
+fig_consumption.add_trace(
+    go.Scatter(
+        x=[None], y=[None],
+        mode='lines',
+        line=dict(color='rgba(0,0,0,0)'),
+        showlegend=True,
+        name=f'📌 MAPE = {round(mape_value, 2)} %'
+    )
 )
+template = "presentation"
 
-file_path = f"{path_to_save}/file.html"
-fig.write_html(file_path)
+fig_consumption.update_layout(template="presentation")
 
-fig.show()
+fig_consumption.show()

@@ -23,6 +23,8 @@ dependencies = [
     "plotly>=6.0.0",
     "matplotlib>=3.9.4",
     "psycopg2-binary>=2.9.10",
+    "tensorflow>=2.18.1",
+    "tqdm>=4.67.1",
 ]
 requires-python = ">=3.9"
 readme = "README.md"
