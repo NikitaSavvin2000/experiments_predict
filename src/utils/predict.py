@@ -20,11 +20,24 @@ from pathlib import Path
 # Загрузка данных и начальная настройка
 # ===============================
 df_init = pd.read_csv('src/data/load_consumption_2025.csv')
+df_init['datetime'] = pd.to_datetime(df_init['datetime'])
+df_init.set_index('datetime', inplace=True)
 measurement = 'load_consumption'
 print(df_init.head())
 print(f'Колонки - {df_init.columns}')
+
 home_path = os.getcwd()
 url_backend = os.getenv("BACKEND_URL", 'http://77.37.136.11:7070')
+
+def add_time_features(df):
+    df['hour'] = df.index.hour
+    df['day_of_week'] = df.index.dayofweek
+    df['month'] = df.index.month
+    df['day_of_year'] = df.index.dayofyear
+    df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+    return df
+
+df_init = add_time_features(df_init)
 
 # ===============================
 # Функции для нормализации и обратной нормализации данных
@@ -71,15 +84,35 @@ def reverse_normalization_request(col_time, col_target, json_list_norm_df, min_v
 # ===============================
 # Нормализация данных
 # ===============================
-json_list_general_norm_df = df_init.to_dict(orient='records')
-logger.info("Normalizing the data.")
+# Преобразование datetime в строку перед сериализацией
+df_init_reset = df_init.reset_index()
+df_init_reset['datetime'] = df_init_reset['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+# Преобразуем DataFrame в список словарей
+json_list_general_norm_df = df_init_reset.to_dict(orient='records')
+
+logger.info("Нормализация данных.")
+# Проверка формата данных перед отправкой на сервер
+print("Пример данных для нормализации:", json_list_general_norm_df[:3])
+print("Ключи в данных:", json_list_general_norm_df[0].keys())
+print("Тип данных datetime:", type(json_list_general_norm_df[0]['datetime']))
+print("Тип данных load_consumption:", type(json_list_general_norm_df[0]['load_consumption']))
+print("Пример datetime:", json_list_general_norm_df[0]['datetime'])
+
+# Отправка данных на сервер для нормализации
 df_general_norm_df, min_val, max_val = normalization_request(
     col_time='datetime',
     col_target=measurement,
     json_list_df=json_list_general_norm_df
 )
-print(df_general_norm_df.head())
-print(f'Колонки после нормализации - {df_general_norm_df.columns}')
+
+if df_general_norm_df is None:
+    logger.error("Ошибка: Не удалось нормализовать данные.")
+else:
+    # Удаление столбца datetime из нормализованных данных
+    df_general_norm_df = df_general_norm_df.drop(columns=['datetime'])
+    print(df_general_norm_df.head())
+    print(f'Колонки после нормализации - {df_general_norm_df.columns}')
 
 # ===============================
 # Подготовка данных для обучения модели
@@ -93,14 +126,25 @@ class TimeSeriesDataset(Dataset):
         return len(self.data) - self.seq_length
 
     def __getitem__(self, idx):
-        x = self.data[idx:idx + self.seq_length].reshape(self.seq_length, 1)
-        y = self.data[idx + self.seq_length]
+        x = self.data.iloc[idx:idx + self.seq_length].values
+        y = self.data.iloc[idx + self.seq_length][measurement]
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
-data = df_general_norm_df[measurement].values
-train_data, test_data = train_test_split(data, test_size=0.2, shuffle=False)
-train_data, val_data = train_test_split(train_data, test_size=0.2, shuffle=False)
-print(test_data)
+# Выбор признаков для обучения
+col_for_train = [
+    measurement, "hour", "day_of_week", "month", "day_of_year", "is_weekend"
+]
+
+# Фильтрация данных
+df = df_general_norm_df[col_for_train]
+
+# Разделение данных на обучающую, валидационную и тестовую выборки
+train_index = int(len(df) * 0.8)
+val_index = int(len(df) * 0.9)
+
+train_data = df.iloc[:train_index]
+val_data = df.iloc[train_index:val_index]
+test_data = df.iloc[val_index:]
 
 seq_length = 24
 train_dataset = TimeSeriesDataset(train_data, seq_length)
@@ -123,20 +167,19 @@ class TransformerModel(nn.Module):
         self.fc = nn.Linear(d_model, output_dim)
 
     def forward(self, x):
-        x = x.squeeze(-1)
-        x = self.embedding(x.unsqueeze(-1))
+        x = self.embedding(x)
         x = self.transformer_encoder(x)
-        x = self.fc(x[:, -1, :])
+        x = self.fc(x[:, -1, :])  
         return x
 
-input_dim = 1
+input_dim = len(col_for_train)  
 d_model = 16
 output_dim = 1
 nhead = 4
 num_layers = 6
 batch_size = 32
-model = TransformerModel(input_dim, d_model, output_dim, nhead, num_layers)
 
+model = TransformerModel(input_dim, d_model, output_dim)
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
@@ -149,12 +192,6 @@ model_save_path = 'best_model.pth'
 num_epochs = 10
 patience = 5
 trigger_times = 0
-
-for batch_x, batch_y in train_loader:
-    print("Batch shape before model:", batch_x.shape)
-    output = model(batch_x)
-    print("Output shape:", output.shape)
-    break
 
 for epoch in range(num_epochs):
     # Тренировочный этап
@@ -199,7 +236,6 @@ for epoch in range(num_epochs):
 # ===============================
 model.load_state_dict(torch.load(model_save_path))
 model.eval()
-
 predictions = []
 with torch.no_grad():
     for batch_x, _ in test_loader:
@@ -213,11 +249,11 @@ print(f'predictions = {predictions}')
 # Обратная нормализация и оценка модели
 # ===============================
 df_predict_norm = pd.DataFrame({
-    measurement: predictions.flatten(), 
-    'datetime': df_general_norm_df['datetime'].values[-len(predictions):] 
+    measurement: predictions.flatten(),
+    'datetime': df_init_reset['datetime'].values[-len(predictions):]  # Берем временные метки из исходного датасета
 })
-json_list_df_predict_norm = df_general_norm_df.to_dict(orient='records')
 
+json_list_df_predict_norm = df_predict_norm.to_dict(orient='records')
 df_predict_denorm = reverse_normalization_request(
     col_time='datetime',
     col_target=measurement,
@@ -225,6 +261,7 @@ df_predict_denorm = reverse_normalization_request(
     min_val=min_val,
     max_val=max_val
 )
+
 print(df_predict_denorm.head())
 
 y_test = test_data[seq_length:]
@@ -233,10 +270,10 @@ mape = 100 * mean_absolute_error(y_test, y_pred) / y_test.mean()
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 print(f'MAPE: {mape:.2f}%')
 print(f'RMSE: {rmse:.2f}')
+
 # ===============================
 # Визуализация исходных данных
 # ===============================
-
 df_init[measurement].plot(title='Исходные данные', figsize=(12, 6))
 plt.xlabel('Индекс')
 plt.ylabel('Потребление')
@@ -252,26 +289,16 @@ fig.show()
 
 if df_predict_denorm is not None and not df_predict_denorm.empty:
     y_test_denorm = test_data[seq_length:] * (max_val - min_val) + min_val
-    datetime_values = df_general_norm_df['datetime'].values[-len(y_test_denorm):]
-    test_start_idx = len(train_data)
-    test_end_idx = test_start_idx + len(test_data)
-    test_datetime = df_general_norm_df['datetime'].values[test_start_idx:test_end_idx]
-    datetime_values = test_datetime[seq_length:]
+    datetime_values = df_init_reset['datetime'].values[-len(y_test_denorm):]
 
     df_plot = pd.DataFrame({
         'Время': datetime_values,
-        'Реальные значения': y_test_denorm,
-        'Предсказания модели': df_predict_denorm[measurement].values[:len(datetime_values)]
-    }).dropna()
+        'Реальные значения': y_test,
+        'Предсказания модели': predictions
+    })
 
     assert len(df_plot['Время']) == len(df_plot['Реальные значения']) == len(df_plot['Предсказания модели']), \
         f"Несовпадение длин: Время {len(datetime_values)}, Реальные {len(y_test_denorm)}, Предсказания {len(df_predict_denorm)}"
-
-    print("Данные для визуализации:")
-    print(df_plot.head())
-    print(f"Длина временных меток: {len(datetime_values)}")
-    print(f"Реальные значения: {len(y_test_denorm)}")
-    print(f"Предсказания: {len(df_predict_denorm)}")
 
     fig = px.line(df_plot, 
                   x='Время', 
@@ -279,6 +306,7 @@ if df_predict_denorm is not None and not df_predict_denorm.empty:
                   title='Сравнение реальных данных и предсказаний модели',
                   labels={'value': 'Потребление', 'variable': 'Тип данных'},
                   color_discrete_map={'Реальные значения': '#2E86C1', 'Предсказания модели': '#E74C3C'})
+
     fig.update_layout(
         xaxis_title='Дата и время',
         yaxis_title='Потребление',
@@ -297,17 +325,6 @@ if df_predict_denorm is not None and not df_predict_denorm.empty:
             type="date"
         )
     )
-
-    train_end_idx = len(train_data) + seq_length
-    if train_end_idx < len(df_general_norm_df):
-        vertical_line_date = pd.to_datetime(df_general_norm_df['datetime'].values[train_end_idx])
-        fig.add_vline(
-            x=vertical_line_date.timestamp(),
-            line_dash="dot", 
-            line_color="gray",
-            annotation_text="Начало предсказаний",
-            annotation_position="top right"
-        )
 
     fig.show()
     html_file = "prediction_comparison.html"
